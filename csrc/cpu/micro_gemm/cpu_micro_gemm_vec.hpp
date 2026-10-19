@@ -3,6 +3,21 @@
 #include "cpu/micro_gemm/cpu_micro_gemm_impl.hpp"
 
 namespace cpu_micro_gemm {
+
+template <typename scalar_t>
+FORCE_INLINE float dot_unpacked(const scalar_t* weight, const scalar_t* input,
+                                int32_t size) {
+  using load_vec_t = typename cpu_utils::VecTypeTrait<scalar_t>::vec_t;
+  vec_op::FP32Vec16 acc0(0.0f), acc1(0.0f);
+  for (int32_t i = 0; i < size; i += 32) {
+    acc0 = acc0 + vec_op::FP32Vec16(load_vec_t(weight + i)) *
+                      vec_op::FP32Vec16(load_vec_t(input + i));
+    acc1 = acc1 + vec_op::FP32Vec16(load_vec_t(weight + i + 16)) *
+                      vec_op::FP32Vec16(load_vec_t(input + i + 16));
+  }
+  return (acc0 + acc1).reduce_sum();
+}
+
 namespace {
 // 8-2-16 pattern, 8 regs for A, 2 regs for B, 16 regs for C, [8, K] @ [k, 32]
 template <typename scalar_t>

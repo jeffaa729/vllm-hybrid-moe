@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU fused MoE experts."""
 
-import importlib.util
 import math
 import os
 import sys
+from pathlib import Path
 from typing import cast
 
 import torch
@@ -60,20 +60,23 @@ logger = init_logger(__name__)
 
 
 class CPUExpertExecutor:
-    """FreeToken C1 executor sharing the cache's GPU-layout pinned host bank."""
+    """Graph-safe C1 executor reading the cache's original CPU weight bank."""
 
     def __init__(self, banks, top_k, config):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Initialize the CPU executor before graph capture")
-        path = config["extension"]
-        spec = importlib.util.spec_from_file_location("ft_cpu_moe_probe", path)
-        if spec is None or spec.loader is None:
-            raise ValueError(f"Cannot load FreeToken CPU extension: {path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        stream = torch.cuda.current_stream().cuda_stream
-        if not module.memops_probe(stream) or module.kernel_io_probe(stream):
-            raise RuntimeError("FreeToken graph-safe CPU synchronization unavailable")
+        from torch.utils.cpp_extension import load
+
+        source_dir = Path(__file__).resolve().parents[5] / "csrc"
+        module = load(
+            name="vllm_cpu_expert_executor",
+            sources=[
+                str(source_dir / "cpu" / f"hybrid_moe.{ext}") for ext in ("cpp", "cu")
+            ],
+            extra_include_paths=[str(source_dir)],
+            extra_cflags=["-O3", "-std=c++20", "-pthread", "-mavx2", "-mfma", "-mf16c"],
+            extra_cuda_cflags=["-O3", "-std=c++20"],
+        )
         cores = sorted(config.get("core_ids", os.sched_getaffinity(0)))
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -91,47 +94,8 @@ class CPUExpertExecutor:
             sorted(os.sched_getaffinity(0)),
         )
         self.banks = banks
-        self.tables = [
-            torch.tensor(
-                [bank[i].data_ptr() for bank in banks], dtype=torch.int64, device="cpu"
-            )
-            for i in range(2)
-        ]
-        experts, two_i, hidden = banks[0][0].shape
-        self.io = {
-            name: torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-            for name, shape, dtype in (
-                ("x", (1, hidden), torch.bfloat16),
-                ("ids", (1, top_k), torch.int32),
-                ("w", (1, top_k), torch.float32),
-                ("y", (1, hidden), torch.bfloat16),
-            )
-        }
         self.routes = torch.empty((1, top_k), dtype=torch.int32, device="cuda")
-        self.native = module.CpuMoeExecutor(
-            num_threads=threads,
-            num_layers=len(banks),
-            num_experts=experts,
-            top_k=top_k,
-            hidden_size=hidden,
-            inter_size=two_i // 2,
-            max_tokens=1,
-            activation_id=0,
-            apply_router_weight_on_input=0,
-            weight_format="bf16",
-            banks={
-                "gate_up": self.tables[0].data_ptr(),
-                "down": self.tables[1].data_ptr(),
-            },
-            options={},
-            swiglu_alpha=1.702,
-            swiglu_limit=float("inf"),
-            core_ids=cores[:threads],
-            **{f"{key}_ptr": value.data_ptr() for key, value in self.io.items()},
-        )
-        self.native.set_spin_wait(True)
-        self.native.start_flag_coordinator(cores[-1])
-        self.native.enable_kernel_io()
+        self.native = module.CPUExecutor(banks, top_k, cores[:threads], cores[-1])
         os.sched_setaffinity(0, cores[threads:-1])
         torch.set_num_threads(
             min(torch.get_num_threads(), max(1, len(cores) - threads - 2))
@@ -140,19 +104,17 @@ class CPUExpertExecutor:
     def submit(self, layer_id, x, weights):
         assert x.dtype == torch.bfloat16 and x.is_contiguous()
         assert weights.dtype == torch.float32 and weights.is_contiguous()
-        self.native.flag_publish(
+        self.native.submit(
             torch.cuda.current_stream().cuda_stream,
             x.data_ptr(),
             self.routes.data_ptr(),
             weights.data_ptr(),
             layer_id,
-            1,
         )
 
     def merge(self, output):
         stream = torch.cuda.current_stream().cuda_stream
-        self.native.flag_wait(stream)
-        self.native.flag_combine(stream, output.data_ptr(), 1, True)
+        self.native.combine(stream, output.data_ptr())
         return output
 
 
