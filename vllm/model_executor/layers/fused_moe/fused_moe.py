@@ -1781,7 +1781,9 @@ def fused_experts_impl(
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         block_shape=block_shape,
-        ignore_invalid_experts=True,
+        # A shared cache can have more physical slots than logical experts.
+        # In that case align logical IDs first, then map blocks to cache slots.
+        ignore_invalid_experts=global_num_experts >= E,
     )
 
     dispatch_fused_moe_kernel(
