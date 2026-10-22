@@ -173,6 +173,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     enable_jit_warmup = worker.vllm_config.kernel_config.enable_jit_warmup
     if enable_jit_warmup:
+        if worker.vllm_config.attention_config.sparse_prefill is not None:
+            from vllm.v1.attention.ops.triton_sparse_prefill import (
+                warmup_sparse_prefill,
+            )
+
+            logger.info("Warming up mean-corrected sparse prefill.")
+            warmup_sparse_prefill(worker.get_model())
         logger.info("JIT kernel warmup starting.")
         jit_warmup_start = time.perf_counter()
         try:
