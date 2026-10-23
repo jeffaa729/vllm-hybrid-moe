@@ -1,116 +1,117 @@
 # vLLM Hybrid MoE
 
-A personal inference-optimization project built on [vLLM](https://github.com/vllm-project/vllm)
-for Mixture-of-Experts models whose BF16 weights exceed GPU memory. It combines
-CPU/GPU expert execution with a persistent GPU expert cache.
-Long-context prefill also supports a FlashPrefill V2-style sparse attention path.
+An inference-optimization project built on vLLM for Mixture-of-Experts models
+whose BF16 weights exceed GPU memory. It improves expert placement, heterogeneous
+execution, and long-context prefill on NVIDIA A100 GPUs.
 
-## Approach
+## Optimizations
 
-### 1. CPU/GPU expert execution
+### Expert cache
 
-Native vLLM UVA offloading keeps selected weights in CPU RAM but executes expert
-computation on the GPU, accessing host weights over the interconnect.
+A model-wide LRU cache retains frequently used experts in GPU memory and replaces
+static whole-parameter placement with expert-granularity loading and eviction.
+Startup memory profiling jointly allocates expert and KV-cache capacity.
 
-This project splits C1 decode work between GPU and CPU: cached experts and
-selected cache misses run on GPU, while remaining misses run on CPU according
-to a configured miss-count policy. CPU computation overlaps GPU work and shares
-the existing CPU weight bank. The raw-weight CPU adapter reuses vLLM's vector
-primitives and SiLU kernel; the handoff supports CUDA Graph replay.
+### CPU/GPU expert computation
 
-### 2. GPU expert cache
+During C1 decode, cached experts and selected misses run on GPU while remaining
+misses run concurrently on CPU from a shared weight bank. CUDA Graph replay and
+double-buffered prefill are supported.
 
-Native UVA uses static, whole-parameter CPU/GPU placement. This project adds a
-model-wide LRU cache at expert granularity: protect active experts, fetch selected
-misses into reusable GPU slots, and retain experts across decoding steps.
+### FlashPrefill
 
-Startup uses vLLM memory profiling to reserve KV capacity for the configured
-context and concurrency, then fills the remaining budget with expert slots.
-Cache initialization preloads resident experts; prefill uses double-buffered
-layer streaming. Cache capacities remain fixed after startup.
-
-Existing vLLM GPU MoE kernels, TP weight sharding, all-reduce and graph capture
-are reused.
-
-### 3. Sparse prefill
-
-A custom A100 Triton implementation follows FlashPrefill V2: mean-pooled K/V
-block selection, exact sink/local attention and mean correction for skipped
-blocks. It reuses vLLM's paged KV cache and split reduction; decode remains dense.
+An A100 Triton sparse-prefill path implements mean-pooled K/V block selection,
+exact sink/local attention, and mean correction for skipped blocks. Decode remains
+dense.
 
 ## Benchmarks
 
-### Expert offloading
+### 1. Qwen3-30B-A3B — 1K prefill chunks
 
-Baseline: **native vLLM UVA offloading**. Both models use BF16, CUDA Graph decode,
-C1, two sequential requests of **8192 input + 256 output tokens**, 1024-token
-chunked prefill, temperature 0 and forced output length. Each backend has one
-measured pass, no client warmups, and matched KV capacity.
+**1× A100 40GB, TP1, BF16, CUDA Graph decode, C1; two sequential 8192-input +
+256-output requests; 1024-token chunks; native generated prompts.**
 
-| Model | Hardware | Prompts | UVA output tok/s | Ours output tok/s | Speedup |
-| --- | --- | --- | ---: | ---: | ---: |
-| Qwen3-30B-A3B | 1× A100 40GB, TP1 | Native generated | 10.37 | 21.54 | **2.08×** |
-| Qwen3-235B-A22B-Instruct-2507 | 4× A100 80GB, TP4 | Archive/chat + code | 3.25 | 6.58 | **2.02×** |
+| Metric | Native UVA | Ours | Speedup |
+| --- | ---: | ---: | ---: |
+| Mean TTFT | 7.95 s | 8.95 s | 0.89× |
+| Decode (1 / mean TPOT) | 15.24 tok/s | 86.81 tok/s | **5.70×** |
+| End-to-end output throughput | 10.37 tok/s | 21.54 tok/s | **2.08×** |
+| Peak GPU memory | 38.14 GiB | 37.95 GiB | — |
+| CPU expert backing | 22.5 GiB | 54 GiB | — |
 
-Output throughput includes prefill and decode. Results compare the complete
-implementation with UVA; they do not isolate the benefit of CPU computation.
+KV allocation is 3.03 GiB; GPU expert allocation is 31.50 GiB for UVA and
+31.28 GiB for ours, including our prefill buffers.
 
-| Model | Mean TTFT, UVA → ours | Mean TPOT, UVA → ours | Peak GPU GiB/device, UVA → ours | CPU expert backing GiB/host, UVA → ours |
+### 2. Qwen3-30B-A3B — 8K prefill chunks
+
+**1× A100 40GB, TP1, BF16, dense FlashAttention 2, Triton MoE, CUDA Graph decode,
+C1; two sequential 8192-input + 256-output requests; 8192-token chunks; native
+generated prompts.**
+
+| Metric | Native UVA | Ours | Speedup |
+| --- | ---: | ---: | ---: |
+| Mean TTFT | 4.844 s | 1.627 s | — |
+| Prefill proxy (input tokens / TTFT) | 1,691 tok/s | 5,035 tok/s | **2.98×** |
+| Decode (1 / mean TPOT) | 14.59 tok/s | 87.35 tok/s | **5.98×** |
+| End-to-end output throughput | 11.47 tok/s | 56.29 tok/s | **4.91×** |
+| Peak GPU memory | 37.77 GiB | 37.61 GiB | — |
+| CPU engine PSS | 25.50 GiB | 55.95 GiB | — |
+
+Both backends use 30.375 GiB GPU expert allocation and 3.028 GiB KV allocation;
+ours includes 2.25 GiB of prefill buffers. CPU expert backing is 23.625 GiB for
+UVA and 54 GiB for ours.
+
+### 3. Qwen3-235B-A22B-Instruct-2507
+
+**4× A100 80GB, TP4, BF16, CUDA Graph decode, C1; two sequential 8192-input +
+256-output requests; 1024-token chunks; archive/chat and code prompts.**
+
+| Metric | Native UVA | Ours | Speedup |
+| --- | ---: | ---: | ---: |
+| Mean TTFT | 23.55 s | 28.12 s | 0.84× |
+| Decode (1 / mean TPOT) | 4.62 tok/s | 23.67 tok/s | **5.12×** |
+| End-to-end output throughput | 3.25 tok/s | 6.58 tok/s | **2.02×** |
+| Peak GPU memory per device | 76.83 GiB | 76.91 GiB | — |
+| CPU expert backing per host | 153 GiB | 423 GiB | — |
+
+KV allocation is 3.54 GiB per device; both backends use 67.50 GiB GPU expert
+allocation per device.
+
+### 4. Expert cache vs expert cache + FlashPrefill
+
+**Qwen3-30B-A3B-Instruct-2507, 1× A100 40GB, TP1, BF16, CUDA Graph decode, C1;
+two requests per configuration; 8192-token chunks; FlashPrefill threshold 0.1.**
+
+| Input | Expert cache tok/s | + FlashPrefill tok/s | Speedup | TTFT, cache → + FlashPrefill |
 | --- | ---: | ---: | ---: | ---: |
-| 30B | 7.95 → 8.95 s | 65.61 → 11.52 ms | 38.14 → 37.95 | 22.5 → 54 |
-| 235B | 23.55 → 28.12 s | 216.27 → 42.25 ms | 76.83 → 76.91 | 153 → 423 |
+| 32K | 24.46 | 25.74 | **1.05×** | 7.07 → 6.52 s |
+| 64K | 11.78 | 14.23 | **1.21×** | 16.76 → 12.89 s |
+| 128K | 4.03 | 6.64 | **1.65×** | 54.98 → 30.66 s |
 
-The improvement comes with higher CPU-memory use and slower time to first token.
-KV allocation is 3.03 GiB/device for 30B and 3.54 GiB/device for 235B. GPU expert
-allocation, including our prefill buffers, is 31.50/31.28 GiB for UVA/ours on 30B,
-and 67.50/67.50 GiB on 235B.
-
-The 30B result is the 2026-10-19 fresh-clone run. The 235B result is the saved
-2026-10-18 TP4 experiment; the latest CPU-executor revision has been revalidated
-on 30B only. These small runs do not establish general model accuracy.
-
-### Expert cache vs expert cache + FlashPrefill
-
-Qwen3-30B-A3B-Instruct-2507 on **1× A100 40GB**, TP1, BF16; EPYC 7K62,
-23.04-core CPU quota, 16 CPU expert threads. CUDA Graph decode, C1, 8K prefill
-chunks, prefix cache disabled, temperature/seed 0, and 256 forced output tokens.
-Two sequential requests per configuration, one measured pass, no client warmups.
-FlashPrefill threshold is 0.1; CPU/GPU expert execution is enabled in both modes.
-
-| Input | Expert cache tok/s | Expert cache + FlashPrefill tok/s | Speedup | TTFT s, cache → +FlashPrefill |
+| Input | Expert allocation | KV | Peak GPU, cache → + FlashPrefill | CPU PSS, cache → + FlashPrefill |
 | --- | ---: | ---: | ---: | ---: |
-| 32K | 24.46 | 25.74 | **1.05×** | 7.07 → 6.52 |
-| 64K | 11.78 | 14.23 | **1.21×** | 16.76 → 12.89 |
-| 128K | 4.03 | 6.64 | **1.65×** | 54.98 → 30.66 |
+| 32K | 31.23 GiB | 3.03 GiB | 38.52 → 39.04 GiB | 55.94 → 55.95 GiB |
+| 64K | 28.23 GiB | 6.02 GiB | 38.52 → 39.04 GiB | 55.94 → 55.95 GiB |
+| 128K | 22.23 GiB | 12.03 GiB | 38.52 → 39.07 GiB | 55.95 → 55.95 GiB |
 
-Rates include prefill and decode. The 32K inputs are native generated prompts;
-64K/128K use two fixed RULER retrieval examples, respectively 65,377–65,486 and
-131,033–131,041 input tokens. Each pair uses identical inputs and expert/KV budgets.
+### 5. Qwen3-30B-A3B — additional C1 workloads
 
-| Input | Expert allocation GiB | KV GiB | Peak GPU GiB, cache → +FlashPrefill | CPU PSS GiB, cache → +FlashPrefill |
-| --- | ---: | ---: | ---: | ---: |
-| 32K | 31.23 | 3.03 | 38.52 → 39.04 | 55.94 → 55.95 |
-| 64K | 28.23 | 6.02 | 38.52 → 39.04 | 55.94 → 55.95 |
-| 128K | 22.23 | 12.03 | 38.52 → 39.07 | 55.95 → 55.95 |
+| Input / output tokens | TTFT s, UVA → ours | Decode tok/s, UVA → ours | E2E output tok/s, UVA → ours |
+| --- | ---: | ---: | ---: |
+| 32,768 / 256 | 21.77 → 6.81 | 13.04 → 72.84 | 6.19 → 24.83 |
+| 1,024 / 1,024 | 1.20 → 1.36 | 14.58 → 94.34 | 14.35 → 83.89 |
 
-Expert allocations include 2.25 GiB of prefill buffers; CPU expert backing is
-54 GiB in both modes. GPU peaks are sampled every 500 ms; CPU PSS is the worker
-snapshot after each pass.
+At 32K, prefill-proxy / decode / E2E speedups are **3.20× / 5.59× / 4.01×**.
+At 1K, TTFT is **13.2% slower**, while decode / E2E improve **6.47× / 5.85×**.
 
-Accuracy checks: both modes retrieved **4/4 access codes** in a separate single
-32K prompt (32 output tokens), and **2/2 reference answers at each of 64K/128K**
-from the measured RULER requests, including the correct first UUID. Generated
-continuations differ; these small checks do not establish general accuracy.
-Results were measured on 2026-10-21.
-
-[Installation and benchmark commands](docs/benchmarking/hybrid_moe.md).
+| Input / output tokens | Peak GPU GiB, UVA → ours | CPU PSS GiB, UVA → ours | Exact output matches |
+| --- | ---: | ---: | ---: |
+| 32,768 / 256 | 37.77 → 37.61 | 25.50 → 55.91 | 1/2 |
+| 1,024 / 1,024 | 37.46 → 37.05 | 25.50 → 55.91 | 2/2 |
 
 ## References
 
-The expert-cache, heterogeneous execution and double-buffered prefill designs
-are informed by FreeToken:
-
 - [FreeToken implementation](https://github.com/FlashML-org/FreeToken)
-- [FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution](https://arxiv.org/abs/2608.16157)
+- [FreeToken paper](https://arxiv.org/abs/2608.16157)
 - [FlashPrefill V2 implementation](https://github.com/qhfan/FlashPrefillv2)
 - [FlashPrefill V2 paper](https://arxiv.org/abs/2608.19758)
