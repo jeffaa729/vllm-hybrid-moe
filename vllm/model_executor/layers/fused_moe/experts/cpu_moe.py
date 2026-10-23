@@ -3,7 +3,9 @@
 """CPU fused MoE experts."""
 
 import math
+import os
 import sys
+from pathlib import Path
 from typing import cast
 
 import torch
@@ -19,6 +21,10 @@ from vllm._custom_ops import (
     cpu_prepack_moe_weight,
     cpu_prepack_moe_weight_int8,
     fused_experts_cpu,
+)
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.zentorch_utils import (
@@ -51,6 +57,67 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
+
+
+class CPUExpertExecutor:
+    """Graph-safe C1 executor reading the cache's original CPU weight bank."""
+
+    def __init__(self, banks, top_k, config):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Initialize the CPU executor before graph capture")
+        from torch.utils.cpp_extension import load
+
+        source_dir = Path(__file__).resolve().parents[5] / "csrc"
+        module = load(
+            name="vllm_cpu_expert_executor",
+            sources=[
+                str(source_dir / "cpu" / f"hybrid_moe.{ext}") for ext in ("cpp", "cu")
+            ],
+            extra_include_paths=[str(source_dir)],
+            extra_cflags=["-O3", "-std=c++20", "-pthread", "-mavx2", "-mfma", "-mf16c"],
+            extra_cuda_cflags=["-O3", "-std=c++20"],
+        )
+        cores = sorted(config.get("core_ids", os.sched_getaffinity(0)))
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        cores = cores[
+            tp_rank * len(cores) // tp_size : (tp_rank + 1) * len(cores) // tp_size
+        ]
+        threads = config["num_threads"]
+        if not 1 <= threads <= len(cores) - 2:
+            raise ValueError("Reserve separate CPU coordinator and serving cores")
+        logger.info(
+            "CPU experts: TP rank %d, %d threads, cores %s (inherited %s)",
+            tp_rank,
+            threads,
+            cores,
+            sorted(os.sched_getaffinity(0)),
+        )
+        self.banks = banks
+        self.routes = torch.empty((1, top_k), dtype=torch.int32, device="cuda")
+        self.native = module.CPUExecutor(banks, top_k, cores[:threads], cores[-1])
+        os.sched_setaffinity(0, cores[threads:-1])
+        torch.set_num_threads(
+            min(torch.get_num_threads(), max(1, len(cores) - threads - 2))
+        )
+
+    def submit(self, layer_id, x, weights):
+        assert x.dtype == torch.bfloat16 and x.is_contiguous()
+        assert weights.dtype == torch.float32 and weights.is_contiguous()
+        self.native.submit(
+            torch.cuda.current_stream().cuda_stream,
+            x.data_ptr(),
+            self.routes.data_ptr(),
+            weights.data_ptr(),
+            layer_id,
+        )
+
+    def merge(self, output):
+        stream = torch.cuda.current_stream().cuda_stream
+        self.native.combine(stream, output.data_ptr())
+        return output
+
+
 # ===========================================================================
 # Weight layout
 # ===========================================================================

@@ -7,6 +7,9 @@ import torch
 import torch.nn.functional as F
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
@@ -38,6 +41,7 @@ from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.offloader.expert_cache import GPUExpertCache
 
 logger = init_logger(__name__)
 
@@ -54,6 +58,60 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.unquantized_backend, self.experts_cls = select_unquantized_moe_backend(
             moe_config=self.moe,
         )
+        config = get_current_vllm_config()
+        self.expert_cache_config = (
+            config.additional_config.get("expert_cache", {})
+            if isinstance(config.additional_config, dict)
+            else {}
+        )
+        self.expert_cache: GPUExpertCache | None = None
+        if self.expert_cache_config.get("num_slots") == "auto" and (
+            config.cache_config.kv_cache_memory_bytes is not None
+            or config.cache_config.num_gpu_blocks_override is not None
+            or envs.VLLM_ENABLE_STARTUP_PLAN
+        ):
+            raise ValueError(
+                "Expert cache auto sizing requires native memory profiling: "
+                "disable KV byte/block overrides and VLLM_ENABLE_STARTUP_PLAN"
+            )
+        self.requires_device_loading = not bool(self.expert_cache_config)
+        if self.expert_cache_config and not (
+            (
+                config.model_config.enforce_eager
+                or (
+                    config.compilation_config.mode == CompilationMode.NONE
+                    and config.compilation_config.cudagraph_mode
+                    == CUDAGraphMode.FULL_DECODE_ONLY
+                )
+            )
+            and config.use_v2_model_runner
+            and config.model_config.hf_config.model_type == "qwen3_moe"
+            and config.parallel_config.pipeline_parallel_size == 1
+            and config.parallel_config.data_parallel_size == 1
+            and config.parallel_config.prefill_context_parallel_size == 1
+            and config.parallel_config.decode_context_parallel_size == 1
+            and not moe.moe_parallel_config.use_ep
+            and not moe.is_sequence_parallel
+            and config.scheduler_config.max_num_seqs == 1
+            and config.speculative_config is None
+            and self.unquantized_backend == UnquantizedMoeBackend.TRITON
+            and moe.in_dtype == torch.bfloat16
+            and not moe.has_bias
+            and not moe.is_lora_enabled
+            and not config.parallel_config.enable_eplb
+            and not config.parallel_config.enable_dbo
+            and not config.model_config.enable_sleep_mode
+            and config.offload_config.uva.cpu_offload_gb == 0
+            and config.offload_config.prefetch.offload_group_size == 0
+            and not is_weights_pre_processed()
+        ):
+            raise ValueError(
+                "Expert cache requires V2 runner, BF16 Qwen3 MoE, "
+                "eager or full decode graphs without torch.compile, "
+                "non-speculative C1, no EPLB/DBO/sleep, "
+                "TP only (no PP/EP/CP/SP), Triton, original weights "
+                "and cpu_offload_gb=0"
+            )
         # MoonEP replaces the named parameters with its [E+B] gate/down
         # split and keeps the up projection outside the parameter registry,
         # so a pre-processed (e.g. ipc_cache) load cannot reconstruct it.
@@ -90,6 +148,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w13_up_dim,
                 hidden_size,
                 dtype=params_dtype,
+                device="cpu" if self.expert_cache_config else None,
+                pin_memory=bool(self.expert_cache_config),
             ),
             requires_grad=False,
         )
@@ -111,6 +171,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
+                device="cpu" if self.expert_cache_config else None,
+                pin_memory=bool(self.expert_cache_config),
             ),
             requires_grad=False,
         )
@@ -219,6 +281,29 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
         super().process_weights_after_loading(layer)
+        if self.expert_cache_config:
+            from vllm.model_executor.offloader.expert_cache import GPUExpertCache
+            from vllm.v1.worker.workspace import current_workspace_manager
+
+            if self.expert_cache is not None:
+                raise ValueError("Expert cache does not support weight reload")
+            config = get_current_vllm_config()
+            capacity = self.expert_cache_config["num_slots"]
+            cpu_config = self.expert_cache_config.get("cpu")
+            self.expert_cache = current_workspace_manager().get_persistent_resource(
+                (GPUExpertCache, id(config)),
+                lambda: GPUExpertCache(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    config.model_config.hf_config.num_hidden_layers,
+                    capacity,
+                    cpu_config,
+                ),
+            )
+            self.cache_layer_id = self.expert_cache.add_layer(
+                layer.w13_weight, layer.w2_weight
+            )
+            return
 
         if is_weights_pre_processed():
             # Weights are already in runtime format; rebuild the kernel only.
@@ -331,6 +416,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self.expert_cache is not None:
+            assert shared_experts is None and not layer.apply_router_weight_on_input
+            return self.expert_cache.apply(
+                self.cache_layer_id,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                is_prefill=get_forward_context().additional_kwargs.get(
+                    "has_prefill", True
+                ),
+            )
         return self.forward_native(
             layer,
             x,

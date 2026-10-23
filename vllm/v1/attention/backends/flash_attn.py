@@ -5,7 +5,7 @@
 import copy
 import functools
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -87,6 +87,9 @@ from vllm.v1.worker.cp_utils import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.ops.triton_sparse_prefill import SparsePrefillAttention
 
 FA4_DENSE_FLOAT_DTYPES = (torch.bfloat16, torch.float16)
 FA4_DENSE_Q_TILE = 128
@@ -1091,6 +1094,40 @@ class FlashAttentionImpl(AttentionImpl):
 
         self.attn_type = attn_type
         vllm_config = get_current_vllm_config_or_none()
+        self.sparse_prefill: SparsePrefillAttention | None = None
+        if (
+            vllm_config is not None
+            and (sparse_config := vllm_config.attention_config.sparse_prefill)
+            is not None
+        ):
+            if (
+                attn_type != AttentionType.DECODER
+                or head_size not in (64, 128)
+                or self.num_queries_per_kv not in (1, 2, 4, 8, 16)
+                or sliding_window is not None
+                or alibi_slopes is not None
+                or logits_soft_cap
+                or sinks is not None
+                or is_quantized_kv_cache(kv_cache_dtype)
+                or self.dcp_world_size != 1
+                or vllm_config.model_config.dtype not in (torch.float16, torch.bfloat16)
+            ):
+                raise ValueError("Sparse prefill requires causal FP16/BF16 MHA/GQA")
+            from vllm.v1.attention.ops.triton_sparse_prefill import (
+                SparsePrefillAttention as SparsePrefill,
+            )
+
+            self.sparse_prefill = SparsePrefill(
+                sparse_config,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                vllm_config.model_config.max_model_len,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.scheduler_config.max_num_seqs,
+                vllm_config.model_config.dtype,
+            )
+            self.sparse_prefill.reserve_workspace()
         uses_kv_cache = attn_type not in (
             AttentionType.ENCODER,
             AttentionType.ENCODER_ONLY,
@@ -1279,6 +1316,27 @@ class FlashAttentionImpl(AttentionImpl):
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
         scheduler_metadata = attn_metadata.scheduler_metadata
+
+        if (
+            self.sparse_prefill is not None
+            and max_seqlen_q > 1
+            and max_seqlen_k >= self.sparse_prefill.config.min_seq_len
+            and attn_metadata.causal is True
+            and attn_metadata.mm_prefix_query_range_tensor is None
+            and attn_metadata.rswa_prefix_lens is None
+        ):
+            self.sparse_prefill.forward(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                output[:num_actual_tokens],
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_k,
+                self.scale,
+            )
+            return output
 
         descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 

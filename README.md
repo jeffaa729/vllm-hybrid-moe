@@ -1,111 +1,117 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# vLLM Hybrid MoE
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+An inference-optimization project built on vLLM for Mixture-of-Experts models
+whose BF16 weights exceed GPU memory. It improves expert placement, heterogeneous
+execution, and long-context prefill on NVIDIA A100 GPUs.
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+## Optimizations
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+### Expert cache
 
----
+A model-wide LRU cache retains frequently used experts in GPU memory and replaces
+static whole-parameter placement with expert-granularity loading and eviction.
+Startup memory profiling jointly allocates expert and KV-cache capacity.
 
-## About
+### CPU/GPU expert computation
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+During C1 decode, cached experts and selected misses run on GPU while remaining
+misses run concurrently on CPU from a shared weight bank. CUDA Graph replay and
+double-buffered prefill are supported.
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+### FlashPrefill
 
-vLLM is fast with:
+An A100 Triton sparse-prefill path implements mean-pooled K/V block selection,
+exact sink/local attention, and mean correction for skipped blocks. Decode remains
+dense.
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+## Benchmarks
 
-vLLM is flexible and easy to use with:
+### 1. Qwen3-30B-A3B — 1K prefill chunks
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+**1× A100 40GB, TP1, BF16, CUDA Graph decode, C1; two sequential 8192-input +
+256-output requests; 1024-token chunks; native generated prompts.**
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
+| Metric | Native UVA | Ours | Speedup |
+| --- | ---: | ---: | ---: |
+| Mean TTFT | 7.95 s | 8.95 s | 0.89× |
+| Decode (1 / mean TPOT) | 15.24 tok/s | 86.81 tok/s | **5.70×** |
+| End-to-end output throughput | 10.37 tok/s | 21.54 tok/s | **2.08×** |
+| Peak GPU memory | 38.14 GiB | 37.95 GiB | — |
+| CPU expert backing | 22.5 GiB | 54 GiB | — |
 
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
+KV allocation is 3.03 GiB; GPU expert allocation is 31.50 GiB for UVA and
+31.28 GiB for ours, including our prefill buffers.
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+### 2. Qwen3-30B-A3B — 8K prefill chunks
 
-## Getting Started
+**1× A100 40GB, TP1, BF16, dense FlashAttention 2, Triton MoE, CUDA Graph decode,
+C1; two sequential 8192-input + 256-output requests; 8192-token chunks; native
+generated prompts.**
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+| Metric | Native UVA | Ours | Speedup |
+| --- | ---: | ---: | ---: |
+| Mean TTFT | 4.844 s | 1.627 s | — |
+| Prefill proxy (input tokens / TTFT) | 1,691 tok/s | 5,035 tok/s | **2.98×** |
+| Decode (1 / mean TPOT) | 14.59 tok/s | 87.35 tok/s | **5.98×** |
+| End-to-end output throughput | 11.47 tok/s | 56.29 tok/s | **4.91×** |
+| Peak GPU memory | 37.77 GiB | 37.61 GiB | — |
+| CPU engine PSS | 25.50 GiB | 55.95 GiB | — |
 
-```bash
-uv pip install vllm
-vllm download-kernels  # precompiled kernels for faster startup
-```
+Both backends use 30.375 GiB GPU expert allocation and 3.028 GiB KV allocation;
+ours includes 2.25 GiB of prefill buffers. CPU expert backing is 23.625 GiB for
+UVA and 54 GiB for ours.
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+### 3. Qwen3-235B-A22B-Instruct-2507
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+**4× A100 80GB, TP4, BF16, CUDA Graph decode, C1; two sequential 8192-input +
+256-output requests; 1024-token chunks; archive/chat and code prompts.**
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+| Metric | Native UVA | Ours | Speedup |
+| --- | ---: | ---: | ---: |
+| Mean TTFT | 23.55 s | 28.12 s | 0.84× |
+| Decode (1 / mean TPOT) | 4.62 tok/s | 23.67 tok/s | **5.12×** |
+| End-to-end output throughput | 3.25 tok/s | 6.58 tok/s | **2.02×** |
+| Peak GPU memory per device | 76.83 GiB | 76.91 GiB | — |
+| CPU expert backing per host | 153 GiB | 423 GiB | — |
 
-## Contributing
+KV allocation is 3.54 GiB per device; both backends use 67.50 GiB GPU expert
+allocation per device.
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+### 4. Expert cache vs expert cache + FlashPrefill
 
-## Citation
+**Qwen3-30B-A3B-Instruct-2507, 1× A100 40GB, TP1, BF16, CUDA Graph decode, C1;
+two requests per configuration; 8192-token chunks; FlashPrefill threshold 0.1.**
 
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
+| Input | Expert cache tok/s | + FlashPrefill tok/s | Speedup | TTFT, cache → + FlashPrefill |
+| --- | ---: | ---: | ---: | ---: |
+| 32K | 24.46 | 25.74 | **1.05×** | 7.07 → 6.52 s |
+| 64K | 11.78 | 14.23 | **1.21×** | 16.76 → 12.89 s |
+| 128K | 4.03 | 6.64 | **1.65×** | 54.98 → 30.66 s |
 
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
+| Input | Expert allocation | KV | Peak GPU, cache → + FlashPrefill | CPU PSS, cache → + FlashPrefill |
+| --- | ---: | ---: | ---: | ---: |
+| 32K | 31.23 GiB | 3.03 GiB | 38.52 → 39.04 GiB | 55.94 → 55.95 GiB |
+| 64K | 28.23 GiB | 6.02 GiB | 38.52 → 39.04 GiB | 55.94 → 55.95 GiB |
+| 128K | 22.23 GiB | 12.03 GiB | 38.52 → 39.07 GiB | 55.95 → 55.95 GiB |
 
-## Contact Us
+### 5. Qwen3-30B-A3B — additional C1 workloads
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+| Input / output tokens | TTFT s, UVA → ours | Decode tok/s, UVA → ours | E2E output tok/s, UVA → ours |
+| --- | ---: | ---: | ---: |
+| 32,768 / 256 | 21.77 → 6.81 | 13.04 → 72.84 | 6.19 → 24.83 |
+| 1,024 / 1,024 | 1.20 → 1.36 | 14.58 → 94.34 | 14.35 → 83.89 |
 
-## Media Kit
+At 32K, prefill-proxy / decode / E2E speedups are **3.20× / 5.59× / 4.01×**.
+At 1K, TTFT is **13.2% slower**, while decode / E2E improve **6.47× / 5.85×**.
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+| Input / output tokens | Peak GPU GiB, UVA → ours | CPU PSS GiB, UVA → ours | Exact output matches |
+| --- | ---: | ---: | ---: |
+| 32,768 / 256 | 37.77 → 37.61 | 25.50 → 55.91 | 1/2 |
+| 1,024 / 1,024 | 37.46 → 37.05 | 25.50 → 55.91 | 2/2 |
+
+## References
+
+- [FreeToken implementation](https://github.com/FlashML-org/FreeToken)
+- [FreeToken paper](https://arxiv.org/abs/2608.16157)
+- [FlashPrefill V2 implementation](https://github.com/qhfan/FlashPrefillv2)
+- [FlashPrefill V2 paper](https://arxiv.org/abs/2608.19758)
