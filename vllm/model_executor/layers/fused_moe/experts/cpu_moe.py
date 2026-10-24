@@ -22,6 +22,7 @@ from vllm._custom_ops import (
     cpu_prepack_moe_weight_int8,
     fused_experts_cpu,
 )
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -60,7 +61,7 @@ logger = init_logger(__name__)
 
 
 class CPUExpertExecutor:
-    """Graph-safe C1 executor reading the cache's original CPU weight bank."""
+    """Graph-safe batched executor reading the cache's original CPU weight bank."""
 
     def __init__(self, banks, top_k, config):
         if torch.cuda.is_current_stream_capturing():
@@ -94,8 +95,15 @@ class CPUExpertExecutor:
             sorted(os.sched_getaffinity(0)),
         )
         self.banks = banks
-        self.routes = torch.empty((1, top_k), dtype=torch.int32, device="cuda")
-        self.native = module.CPUExecutor(banks, top_k, cores[:threads], cores[-1])
+        vllm_config = get_current_vllm_config()
+        max_tokens = max(
+            vllm_config.scheduler_config.max_num_seqs,
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+        )
+        self.routes = torch.empty((max_tokens, top_k), dtype=torch.int32, device="cuda")
+        self.native = module.CPUExecutor(
+            banks, top_k, max_tokens, cores[:threads], cores[-1]
+        )
         os.sched_setaffinity(0, cores[threads:-1])
         torch.set_num_threads(
             min(torch.get_num_threads(), max(1, len(cores) - threads - 2))
@@ -110,11 +118,12 @@ class CPUExpertExecutor:
             self.routes.data_ptr(),
             weights.data_ptr(),
             layer_id,
+            x.shape[0],
         )
 
     def merge(self, output):
         stream = torch.cuda.current_stream().cuda_stream
-        self.native.combine(stream, output.data_ptr())
+        self.native.combine(stream, output.data_ptr(), output.shape[0])
         return output
 
 

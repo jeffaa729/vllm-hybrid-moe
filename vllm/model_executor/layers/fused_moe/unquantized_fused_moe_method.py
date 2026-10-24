@@ -92,7 +92,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             and config.parallel_config.decode_context_parallel_size == 1
             and not moe.moe_parallel_config.use_ep
             and not moe.is_sequence_parallel
-            and config.scheduler_config.max_num_seqs == 1
             and config.speculative_config is None
             and self.unquantized_backend == UnquantizedMoeBackend.TRITON
             and moe.in_dtype == torch.bfloat16
@@ -108,7 +107,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             raise ValueError(
                 "Expert cache requires V2 runner, BF16 Qwen3 MoE, "
                 "eager or full decode graphs without torch.compile, "
-                "non-speculative C1, no EPLB/DBO/sleep, "
+                "non-speculative decoding, no EPLB/DBO/sleep, "
                 "TP only (no PP/EP/CP/SP), Triton, original weights "
                 "and cpu_offload_gb=0"
             )
@@ -427,6 +426,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 is_prefill=get_forward_context().additional_kwargs.get(
                     "has_prefill", True
                 ),
+                padding=get_forward_context().is_padding,
             )
         return self.forward_native(
             layer,
