@@ -38,6 +38,9 @@ def _ensure_experts(
     PREFILL: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    NUM_TOKENS: tl.constexpr = 1,
+    BLOCK_ROUTES: tl.constexpr = 8,
+    padding=None,
     cpu_routes=None,
     recency=None,
     fetch_counts=None,
@@ -49,19 +52,34 @@ def _ensure_experts(
     base = layer_id * E
     step = tl.load(clock) + 1
     tl.store(clock, step)
+    frequency = tl.full((BLOCK_E,), 1, tl.int32)
     active = (experts < E) & PREFILL
     if not PREFILL:
-        for i in range(K):
-            active |= experts == tl.load(routes + i)
+        offsets = tl.arange(0, BLOCK_ROUTES)
+        valid = offsets < NUM_TOKENS * K
+        if padding is not None:
+            valid &= ~tl.load(padding + offsets // K, valid, other=True)
+        route_ids = tl.load(routes + offsets, valid, other=0)
+        valid &= (route_ids >= 0) & (route_ids < E)
+        frequency = tl.histogram(route_ids, BLOCK_E, mask=valid)
+        active = (experts < E) & (frequency > 0)
     mapped = tl.load(slot_for_id + base + experts, experts < E, other=-1)
     missing = active & (mapped < 0)
     ranks = tl.cumsum(missing.to(tl.int32)) - 1
     count = tl.sum(missing.to(tl.int32))
-    fetch = count
+    work = count
+    cpu_budget = 0
     if HYBRID:
-        fetch = tl.load(fetch_counts + count)
+        # Bound CPU expert-token work by the calibrated single-token budget.
+        capped = tl.minimum(count, K)
+        cpu_budget = capped - tl.load(fetch_counts + capped)
+        work = tl.sum(tl.where(missing, frequency, 0))
         recent = tl.load(recency + base + experts, experts < E, other=0)
-        priority = tl.where(missing, recent * E + E - 1 - experts, -1)
+        priority = tl.where(
+            missing,
+            (frequency.to(tl.int64) * (step + 1) + recent) * E + E - 1 - experts,
+            -1,
+        )
     tl.store(sources + experts, -1, experts < E)
     tl.store(usage + mapped, step, active & (mapped >= 0))
     tl.debug_barrier()
@@ -70,30 +88,40 @@ def _ensure_experts(
     ages = tl.load(usage + slots, slots < C, other=0)
     protected = (owners >= base) & (owners < base + E) & PREFILL
     if not PREFILL:
-        for i in range(K):
-            protected |= owners == base + tl.load(routes + i)
+        owner_experts = tl.minimum(tl.maximum(owners - base, 0), BLOCK_E - 1)
+        protected = (
+            (owners >= base)
+            & (owners < base + E)
+            & (tl.gather(frequency, owner_experts, 0) > 0)
+        )
     ages = tl.where(protected | (slots >= C), 0x7FFFFFFFFFFFFFFF, ages)
-    for i in range(fetch):
+    fetch = 0
+    while work > cpu_budget:
         victim = tl.argmin(ages, 0).to(tl.int32)
         old_id = tl.sum(tl.where(slots == victim, owners, 0))
         if HYBRID:
             expert = tl.argmax(priority, 0).to(tl.int32)
             priority = tl.where(experts == expert, -1, priority)
+            work -= tl.sum(tl.where(experts == expert, frequency, 0))
         else:
-            expert = tl.min(tl.where(missing & (ranks == i), experts, E), 0)
+            expert = tl.min(tl.where(missing & (ranks == fetch), experts, E), 0)
+            work -= 1
         tl.store(slot_for_id + old_id, -1, old_id >= 0)
         tl.store(slot_for_id + base + expert, victim)
         tl.store(id_of_slot + victim, base + expert)
         tl.store(usage + victim, step)
-        tl.store(sources + i, expert)
-        tl.store(destinations + i, victim)
+        tl.store(sources + fetch, expert)
+        tl.store(destinations + fetch, victim)
         ages = tl.where(slots == victim, 0x7FFFFFFFFFFFFFFF, ages)
+        fetch += 1
     if HYBRID:
         tl.debug_barrier()
-        for i in range(K):
-            expert = tl.load(routes + i)
-            slot = tl.load(slot_for_id + base + expert)
-            tl.store(cpu_routes + i, tl.where(slot < 0, expert, -1))
+        mapped_routes = tl.load(slot_for_id + base + route_ids, valid, other=-1)
+        tl.store(
+            cpu_routes + offsets,
+            tl.where(valid & (mapped_routes < 0), route_ids, -1),
+            offsets < NUM_TOKENS * K,
+        )
         tl.store(recency + base + experts, step, active)
         tl.store(cpu_stats, tl.load(cpu_stats) + count - fetch)
         tl.store(cpu_stats + 1, tl.load(cpu_stats + 1) + (count > fetch))
@@ -344,11 +372,12 @@ class GPUExpertCache:
         self.prefill_done[buffer_id].record()
         return output
 
-    def apply(self, layer_id, layer, x, topk_weights, topk_ids, *, is_prefill):
+    def apply(
+        self, layer_id, layer, x, topk_weights, topk_ids, *, is_prefill, padding=None
+    ):
         from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
         assert topk_ids.is_contiguous()
-        assert is_prefill or x.shape[0] == 1
         if self.cpu_config and self.cpu_executor is None:
             from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
                 CPUExpertExecutor,
@@ -384,6 +413,9 @@ class GPUExpertCache:
             is_prefill,
             triton.next_power_of_2(self.num_experts),
             triton.next_power_of_2(self.capacity),
+            NUM_TOKENS=x.shape[0],
+            BLOCK_ROUTES=triton.next_power_of_2(topk_ids.numel()),
+            padding=padding,
             cpu_routes=cpu.routes if cpu else None,
             recency=self.recency if cpu else None,
             fetch_counts=self.fetch_counts if cpu else None,
@@ -393,7 +425,9 @@ class GPUExpertCache:
         if cpu:
             cpu.submit(layer_id, x, topk_weights)
         n13, n2 = self.w13[0].numel(), self.w2[0].numel()
-        rows = self.num_experts if is_prefill else topk_ids.shape[1]
+        rows = (
+            self.num_experts if is_prefill else min(self.num_experts, topk_ids.numel())
+        )
         _copy_experts[(triton.cdiv(max(n13, n2), 4096), rows)](
             *self.host_views[layer_id],
             self.w13,

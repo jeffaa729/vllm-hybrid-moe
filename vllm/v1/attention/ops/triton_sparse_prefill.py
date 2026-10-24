@@ -3,8 +3,8 @@
 """SM80+ paged sparse prefill, following FlashPrefill V2 (arXiv:2608.19758).
 
 Reference: https://github.com/qhfan/FlashPrefillv2, commit 75b58f2.
-Block-mean selection and correction are reimplemented in native Triton;
-paging, packed GQA, workspace ownership and split reduction follow vLLM.
+Selection aggregates 128 packed query rows; two 64-row SM80 compute tiles
+share that selection and compensate pruned blocks with their K/V means.
 """
 
 import torch
@@ -200,6 +200,7 @@ def _sparse_attention(
     CAPACITY: tl.constexpr,
     SPLITS: tl.constexpr,
     M: tl.constexpr,
+    SELECT_M: tl.constexpr,
     N: tl.constexpr,
     B: tl.constexpr,
 ):
@@ -222,8 +223,10 @@ def _sparse_attention(
         pos[:, None] < qlen,
         other=0,
     )
-    row = (tile * HEADS + head) * CAPACITY
-    count = tl.load(Counts + tile * HEADS + head)
+    selection_local = local // (SELECT_M // M)
+    selection_tile = begin // (SELECT_M // GROUP) + seq + selection_local
+    row = (selection_tile * HEADS + head) * CAPACITY
+    count = tl.load(Counts + selection_tile * HEADS + head)
     per_split = tl.cdiv(count, SPLITS)
     m = tl.full((M,), float("-inf"), tl.float32)
     denominator = tl.zeros((M,), tl.float32)
@@ -270,8 +273,8 @@ def _sparse_attention(
         acc = tl.dot(p.to(v.dtype), v, acc * alpha[:, None])
         denominator = denominator * alpha + tl.sum(p, 1)
         m = next_m
-    # Only blocks fully visible to every packed query row are approximated.
-    full_blocks = (klen - qlen + local * (M // GROUP)) // B
+    # Both compute halves use the visibility boundary of their selection tile.
+    full_blocks = (klen - qlen + selection_local * (SELECT_M // GROUP)) // B
     correction_chunks = tl.cdiv(full_blocks, N)
     per_split = tl.cdiv(correction_chunks, SPLITS)
     for chunk in range(
@@ -330,9 +333,10 @@ class SparsePrefillAttention:
         self.max_num_tokens = max_num_tokens
         self.block_m = 64
         self.block_q = self.block_m // self.group
-        self.tail_tiles = cdiv(config.dense_tail_tiles * 128, self.block_m)
+        self.selection_m = 128
+        self.selection_q = self.selection_m // self.group
         self.max_blocks = cdiv(max_model_len, 128)
-        self.max_tiles = cdiv(max_num_tokens, self.block_q) + max_num_seqs
+        self.max_tiles = cdiv(max_num_tokens, self.selection_q) + max_num_seqs
         index_shape = (self.max_tiles, num_kv_heads, self.max_blocks)
         mean_shape = (max_num_seqs, self.max_blocks, num_kv_heads, head_size)
         partial_shape = (max_num_tokens, num_heads, config.num_splits)
@@ -358,6 +362,7 @@ class SparsePrefillAttention:
         )
         num_seqs = lengths.numel()
         tiles = q.shape[0] // self.block_q + num_seqs
+        selection_tiles = q.shape[0] // self.selection_q + num_seqs
         common = dict(
             HEADS=self.num_kv_heads, DIM=self.head_size, CAPACITY=self.max_blocks
         )
@@ -376,7 +381,7 @@ class SparsePrefillAttention:
             **common,
             num_warps=4,
         )
-        _select_blocks[(tiles, self.num_kv_heads)](
+        _select_blocks[(selection_tiles, self.num_kv_heads)](
             q,
             km,
             starts,
@@ -394,8 +399,8 @@ class SparsePrefillAttention:
             CHUNKS=cdiv(self.max_blocks, 32),
             SINK=self.config.sink_blocks,
             WINDOW=self.config.window_blocks,
-            TAIL=self.tail_tiles,
-            M=self.block_m,
+            TAIL=self.config.dense_tail_tiles,
+            M=self.selection_m,
             B=128,
             N=32,
             SCAN=triton.next_power_of_2(self.max_blocks),
@@ -427,6 +432,7 @@ class SparsePrefillAttention:
             GROUP=self.group,
             SPLITS=self.config.num_splits,
             M=self.block_m,
+            SELECT_M=self.selection_m,
             N=64,
             B=128,
             **common,

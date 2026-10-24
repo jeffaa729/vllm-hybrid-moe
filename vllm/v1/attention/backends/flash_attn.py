@@ -1325,18 +1325,24 @@ class FlashAttentionImpl(AttentionImpl):
             and attn_metadata.mm_prefix_query_range_tensor is None
             and attn_metadata.rswa_prefix_lens is None
         ):
-            self.sparse_prefill.forward(
-                query[:num_actual_tokens],
-                key_cache,
-                value_cache,
-                output[:num_actual_tokens],
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_k,
-                self.scale,
-            )
-            return output
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            if (
+                extract_layer_index(layer.layer_name)
+                >= self.sparse_prefill.config.full_attention_layers
+            ):
+                self.sparse_prefill.forward(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_k,
+                    self.scale,
+                )
+                return output
 
         descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
