@@ -49,7 +49,7 @@ class SparsePrefillConfig:
     sink_blocks: int = Field(default=2, ge=1)
     """Number of initial KV blocks always retained."""
 
-    window_blocks: int = Field(default=4, ge=1)
+    window_blocks: int = Field(default=16, ge=1)
     """Number of recent KV blocks always retained."""
 
     dense_tail_tiles: int = Field(default=8, ge=0)
