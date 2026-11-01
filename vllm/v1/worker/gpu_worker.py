@@ -742,6 +742,19 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+        for module in self.model_runner.get_model().modules():
+            cache = getattr(getattr(module, "quant_method", None), "expert_cache", None)
+            if cache is not None and cache.auto_size:
+                self.available_kv_cache_memory_bytes, delta = (
+                    cache.finish_startup_sizing(
+                        self.vllm_config,
+                        self.model_runner.get_kv_cache_spec(),
+                        self.available_kv_cache_memory_bytes,
+                    )
+                )
+                self.model_runner.model_memory_usage += delta
+                self.total_consumed += delta
+                profile_result.non_kv_cache_memory += delta
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(

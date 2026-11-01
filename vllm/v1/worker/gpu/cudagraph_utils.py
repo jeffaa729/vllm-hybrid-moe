@@ -31,7 +31,11 @@ from vllm.distributed.parallel_state import (
     graph_capture,
     is_global_first_rank,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
@@ -749,6 +753,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
                 ):
+                    get_forward_context().additional_kwargs["has_prefill"] = (
+                        desc.uniform_token_count is None and desc.max_query_len is None
+                    )
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside
                         # run_pw_graph).

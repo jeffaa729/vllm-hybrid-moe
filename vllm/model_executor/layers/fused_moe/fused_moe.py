@@ -1674,6 +1674,7 @@ def fused_experts_impl(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    return_expert_outputs: bool = False,
 ) -> torch.Tensor:
     if ocp_mx_scheme is not None:
         raise NotImplementedError(
@@ -1781,7 +1782,9 @@ def fused_experts_impl(
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         block_shape=block_shape,
-        ignore_invalid_experts=True,
+        # A shared cache can have more physical slots than logical experts.
+        # In that case align logical IDs first, then map blocks to cache slots.
+        ignore_invalid_experts=global_num_experts >= E,
     )
 
     dispatch_fused_moe_kernel(
@@ -1846,6 +1849,9 @@ def fused_experts_impl(
         block_shape=block_shape,
         B_bias=w2_bias,
     )
+
+    if return_expert_outputs:
+        return intermediate_cache3
 
     ops.moe_sum(
         intermediate_cache3.view(*intermediate_cache3.size()),
