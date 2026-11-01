@@ -34,6 +34,32 @@ class HiSparseConfig:
 
 
 @config
+class SparsePrefillConfig:
+    """FlashPrefill V2-style approximate prefill with dense decode."""
+
+    threshold: float = Field(default=0.1, ge=0, le=1)
+    """Keep blocks whose aggregate energy reaches this fraction of the peak."""
+
+    min_seq_len: int = Field(default=4096, ge=1)
+    """Use dense attention below this KV length."""
+
+    full_attention_layers: int = Field(default=4, ge=0)
+    """Keep the first model layers dense, following the official V2 recipe."""
+
+    sink_blocks: int = Field(default=2, ge=1)
+    """Number of initial KV blocks always retained."""
+
+    window_blocks: int = Field(default=16, ge=1)
+    """Number of recent KV blocks always retained."""
+
+    dense_tail_tiles: int = Field(default=8, ge=0)
+    """Keep the last 128-row packed query tiles of each chunk dense."""
+
+    num_splits: Literal[1, 2, 4] = 4
+    """Number of KV partitions computed before merging attention outputs."""
+
+
+@config
 class AttentionConfig:
     """Configuration for attention mechanisms in vLLM."""
 
@@ -57,6 +83,9 @@ class AttentionConfig:
     flash_attn_version: Literal[2, 3, 4] | None = None
     """Force vllm to use a specific flash-attention version (2, 3, or 4).
     Only valid when using the flash-attention backend."""
+
+    sparse_prefill: SparsePrefillConfig | None = None
+    """Opt-in mean-corrected sparse prefill for causal FP16/BF16 attention."""
 
     flash_attn_max_num_splits_for_cuda_graph: int = 32
     """Flash Attention max number splits for cuda graph decode."""
