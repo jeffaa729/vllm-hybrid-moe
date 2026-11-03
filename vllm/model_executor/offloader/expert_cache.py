@@ -235,6 +235,21 @@ class GPUExpertCache:
                 else 0
             )
         ]
+        reserved = len(self.prefill_weights) * self.num_experts
+        full_layers, partial = divmod(capacity - reserved, self.num_experts)
+        self.preload_spans: dict[int, tuple[int, int]] = {}
+        for index in range(full_layers):
+            layer_id = index * (num_layers - 1) // max(full_layers - 1, 1)
+            self.preload_spans[layer_id] = (
+                reserved + index * self.num_experts,
+                self.num_experts,
+            )
+        if partial:
+            layer_id = next(i for i in range(num_layers) if i not in self.preload_spans)
+            self.preload_spans[layer_id] = (
+                reserved + full_layers * self.num_experts,
+                partial,
+            )
         self.prefill_stream = torch.cuda.Stream(device=self.w13.device)
         self.prefill_ready = [torch.cuda.Event() for _ in self.prefill_weights]
         self.prefill_done = [torch.cuda.Event() for _ in self.prefill_weights]
@@ -263,22 +278,17 @@ class GPUExpertCache:
                 get_accelerator_view_from_cpu_tensor(w2),
             )
         )
-        reserved = len(self.prefill_weights) * self.num_experts
-        first_id = self.slot_for_id.numel() - (self.capacity - reserved)
-        first_expert = max(0, first_id - layer_id * self.num_experts)
-        if first_expert < self.num_experts:
-            first_slot = (
-                reserved + layer_id * self.num_experts + first_expert - first_id
-            )
-            last_slot = first_slot + self.num_experts - first_expert
-            self.w13[first_slot:last_slot].copy_(w13[first_expert:], non_blocking=True)
-            self.w2[first_slot:last_slot].copy_(w2[first_expert:], non_blocking=True)
+        first_slot, count = self.preload_spans.get(layer_id, (0, 0))
+        if count:
+            last_slot = first_slot + count
+            self.w13[first_slot:last_slot].copy_(w13[:count], non_blocking=True)
+            self.w2[first_slot:last_slot].copy_(w2[:count], non_blocking=True)
             slots = torch.arange(
                 first_slot, last_slot, dtype=torch.int32, device=self.w13.device
             )
-            self.slot_for_id[layer_id, first_expert:] = slots
+            self.slot_for_id[layer_id, :count] = slots
             self.id_of_slot[first_slot:last_slot] = (
-                layer_id * self.num_experts + first_expert + slots - first_slot
+                layer_id * self.num_experts + slots - first_slot
             )
         return layer_id
 
@@ -342,12 +352,28 @@ class GPUExpertCache:
         self.usage[: 2 * self.num_experts].zero_()
         self.prefill_layers = [-1, -1]
         self.prefill_snapshot = self.slot_for_id.cpu().tolist()
+        self.prefill_resident_slots = [
+            slots[0]
+            if slots[0] >= 2 * self.num_experts
+            and slots == list(range(slots[0], slots[0] + self.num_experts))
+            else -1
+            for slots in self.prefill_snapshot
+        ]
+        self.prefill_staged_layers = [
+            i for i, slot in enumerate(self.prefill_resident_slots) if slot < 0
+        ]
+        self.prefill_buffer_ids = {
+            layer_id: index % 2
+            for index, layer_id in enumerate(self.prefill_staged_layers)
+        }
         self.prefill_stream.wait_stream(torch.cuda.current_stream())
 
     def _prefetch_layer(self, layer_id):
         if layer_id >= len(self.host_weights):
             return
-        buffer_id = layer_id % 2
+        if self.prefill_resident_slots[layer_id] >= 0:
+            return
+        buffer_id = self.prefill_buffer_ids[layer_id]
         if self.prefill_layers[buffer_id] == layer_id:
             return
         weights = self.prefill_weights[buffer_id]
@@ -386,19 +412,34 @@ class GPUExpertCache:
         if layer_id == 0:
             self._begin_prefill()
         self._prefetch_layer(layer_id)
-        buffer_id = layer_id % 2
-        torch.cuda.current_stream().wait_event(self.prefill_ready[buffer_id])
-        self._prefetch_layer(layer_id + 1)
+        buffer_id = self.prefill_buffer_ids.get(layer_id, 0)
+        resident = self.prefill_resident_slots[layer_id]
+        if resident >= 0:
+            weights = (
+                self.w13[resident : resident + self.num_experts],
+                self.w2[resident : resident + self.num_experts],
+            )
+            self.stats[3].add_(self.num_experts)
+            self.stats[5].add_(1)
+        else:
+            weights = self.prefill_weights[buffer_id]
+            torch.cuda.current_stream().wait_event(self.prefill_ready[buffer_id])
+        next_layer = next(
+            (i for i in self.prefill_staged_layers if i > layer_id),
+            len(self.host_weights),
+        )
+        self._prefetch_layer(next_layer)
         output = fused_experts(
             x,
-            self.prefill_weights[buffer_id][0],
-            self.prefill_weights[buffer_id][1],
+            weights[0],
+            weights[1],
             topk_weights,
             topk_ids,
             activation=layer.activation,
             global_num_experts=self.num_experts,
         )
-        self.prefill_done[buffer_id].record()
+        if resident < 0:
+            self.prefill_done[buffer_id].record()
         return output
 
     def apply(

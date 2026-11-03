@@ -69,8 +69,7 @@ class CPUExecutor {
     const auto* input = x_.data_ptr<bf16>();
     const auto* w13 = banks_[layer_].first.data_ptr<bf16>();
     const auto* w2 = banks_[layer_].second.data_ptr<bf16>();
-    for (int index = tid * 32; index < num_tokens_ * top_k_ * intermediate_;
-         index += threads_ * 32) {
+    for (int index = tid * 32; index < num_tokens_ * top_k_ * intermediate_; index += threads_ * 32) {
       int route = index / intermediate_;
       int row = index % intermediate_;
       if (ids[route] >= 0) {
@@ -92,14 +91,12 @@ class CPUExecutor {
         cpu_fused_moe_utils::silu_and_mul(gate_up, activated, 1, 64, 64, 32);
         for (int j = 0; j < 32; ++j) {
           // CUDA rounds SiLU to BF16 before multiplying by the up projection.
-          intermediate_values_[index + j] =
-              bf16(float(bf16(activated[j])) * up[j]);
+          intermediate_values_[index + j] = bf16(float(bf16(activated[j])) * up[j]);
         }
       }
     }
     phase_.arrive_and_wait();
-    for (int first = tid * 32; first < num_tokens_ * top_k_ * hidden_;
-         first += threads_ * 32) {
+    for (int first = tid * 32; first < num_tokens_ * top_k_ * hidden_;first += threads_ * 32) {
       for (int index = first; index < first + 32; ++index) {
         int route = index / hidden_;
         int row = index % hidden_;
@@ -159,10 +156,8 @@ class CPUExecutor {
         torch::TensorOptions().device(torch::kCPU).pinned_memory(true);
     x_ = torch::empty({max_tokens_, hidden_}, options.dtype(torch::kBFloat16));
     ids_ = torch::empty({max_tokens_, top_k_}, options.dtype(torch::kInt32));
-    weights_ =
-        torch::empty({max_tokens_, top_k_}, options.dtype(torch::kFloat32));
-    output_ =
-        torch::empty({max_tokens_, hidden_}, options.dtype(torch::kBFloat16));
+    weights_ = torch::empty({max_tokens_, top_k_}, options.dtype(torch::kFloat32));
+    output_ = torch::empty({max_tokens_, hidden_}, options.dtype(torch::kBFloat16));
     flags_ = torch::zeros({64}, options.dtype(torch::kInt32));
     device_x_ = device_pointer<bf16>(x_);
     device_ids_ = device_pointer<int32_t>(ids_);
